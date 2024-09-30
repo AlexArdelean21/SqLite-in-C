@@ -1,9 +1,12 @@
 #define _CRT_SECURE_NO_WARNINGS
+#include <errno.h>
+#include <windows.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+
 
 #pragma region Defined variables
 
@@ -12,8 +15,8 @@
 
 typedef struct {
     uint32_t id;
-    char username[COLUMN_USERNAME_SIZE];
-    char email[COLUMN_EMAIL_SIZE];
+    char username[COLUMN_USERNAME_SIZE + 1];
+    char email[COLUMN_EMAIL_SIZE + 1];
 }Row;
 
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
@@ -39,7 +42,7 @@ typedef struct {
 typedef enum { EXECUTE_SUCCESS, EXECUTE_TABLE_FULL }ExecuteResult;
 typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
 typedef enum { META_COMMAND_SUCCESS, META_COMMAND_UNRECOGNIZED_COMMAND } MetaCommandResult;
-typedef enum { PREPARE_SUCCESS, PREPARE_SYNTAX_ERROR, PREPARE_UNRECOGNIZED_STATEMENT } PrepareResult;
+typedef enum { PREPARE_SUCCESS, PREPARE_NEGATIVE_ID, PREPARE_STRING_TOO_LONG, PREPARE_SYNTAX_ERROR, PREPARE_UNRECOGNIZED_STATEMENT } PrepareResult;
 
 
 typedef struct {
@@ -49,13 +52,19 @@ typedef struct {
 } InputBuffer;
 
 typedef struct {
+    HANDLE  file_handle;
+    uint32_t file_lenght;
+    void* pages[TABLE_MAX_PAGES];
+}Pager;
+
+typedef struct {
     StatementType type;
     Row row_to_insert;
 }Statement;
 
 typedef struct {
+    Pager* pager;
     uint32_t num_rows;
-    void* pages[TABLE_MAX_PAGES];
 }Table;
 
 #pragma endregion
@@ -104,11 +113,54 @@ void close_input_buffer(InputBuffer* new_input_buffer) {
 
 #pragma endregion
 
+
+void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
+    if (pager->pages[page_num] == NULL) {
+        printf("Tried to flush null page\n");
+        exit(EXIT_FAILURE);
+    }
+
+    SetFilePointer(pager->file_handle, page_num * PAGE_SIZE, NULL, FILE_BEGIN);
+
+    DWORD bytes_written;
+    if (!WriteFile(pager->file_handle, pager->pages[page_num], size, &bytes_written, NULL)) {
+        printf("Error writing to file\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void db_close(Table* table) {
+    Pager* pager = table->pager;
+    uint32_t num_full_gages = table->num_rows / ROWS_PER_PAGE;
+
+    for (uint32_t i = 0; i < num_full_gages; i++) {
+        if (pager->pages[i] == NULL) {
+            continue;
+        }
+
+        pager_flush(pager, i, PAGE_SIZE);
+        free(pager->pages[i]);
+        pager->pages[i] = NULL;
+    }
+    CloseHandle(pager->file_handle);
+
+    for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+        void* page = pager->pages[i];
+        if (page) {
+            free(page);
+            pager->pages[i] = NULL;
+        }
+    }
+    free(pager);
+    free(table);
+
+}
+
 #pragma region part2
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
     if (strcmp(input_buffer->buffer, ".exit") == 0) {
         close_input_buffer(input_buffer);
-        free(table);
+        db_close(table);
         exit(EXIT_SUCCESS);
     }
     else {
@@ -116,21 +168,38 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
     }
 }
 
+PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
+    statement->type = STATEMENT_INSERT;
+    char* keyword = strtok(input_buffer->buffer, " ");
+    char* id_string = strtok(NULL, " ");
+    char* username = strtok(NULL, " ");
+    char* email = strtok(NULL, " ");
+
+    if (id_string == NULL || username == NULL || email == NULL) {
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    int id = atoi(id_string);
+    if (id < 0) {
+        return PREPARE_NEGATIVE_ID;
+    }
+    if (strlen(username) > COLUMN_USERNAME_SIZE || strlen(email) > COLUMN_EMAIL_SIZE) {
+        return PREPARE_STRING_TOO_LONG;
+    }
+
+    statement->row_to_insert.id = id;
+    strcpy(statement->row_to_insert.email, email);
+    strcpy(statement->row_to_insert.username, username);
+
+    return PREPARE_SUCCESS;
+}
+
 PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement) {
     if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
-        statement->type = STATEMENT_INSERT;
-
-        int args_assigned = sscanf(input_buffer->buffer, "insert %d %s %s",
-            &(statement)->row_to_insert.id,
-            statement->row_to_insert.username,
-            statement->row_to_insert.email);
-
-            if (args_assigned < 3) {
-                return PREPARE_SYNTAX_ERROR;
-            }
-            return PREPARE_SUCCESS;
+        return prepare_insert(input_buffer, statement); 
     }
-    if (strcmp(input_buffer->buffer, "select") == 0) {
+
+    if (strncmp(input_buffer->buffer, "select", 6) == 0) {
         statement->type = STATEMENT_SELECT;
         return PREPARE_SUCCESS;
     }
@@ -141,22 +210,34 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
 
 #pragma region Part3
 
-Table* new_table() {
-    Table* table = (Table*)malloc(sizeof(Table));
-    table->num_rows = 0;
+Pager* pager_open(const char* filename) {
+    HANDLE file_handle = CreateFile(
+        filename,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (file_handle == INVALID_HANDLE_VALUE) {
+        printf("Unable to open file\n");
+        exit(EXIT_FAILURE);
+    }
+
+    DWORD file_size = GetFileSize(file_handle, NULL);
+
+    Pager* pager = malloc(sizeof(Pager));
+    pager->file_handle = file_handle;
+    pager->file_lenght = file_size;
+
     for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-        table->pages[i] = NULL;
+        pager->pages[i] = NULL;
     }
-    return table;
-}
 
-void free_table(Table* table) {
-    for (int i = 0; table->pages[i]; i++) {
-        free(table->pages[i]);
-    }
-    free(table);
+    return pager;
 }
-
 
 void print_row(Row* row) {
     printf("(%d, %s, %s)\n", row->id, row->username, row->email);
@@ -169,17 +250,56 @@ void serialize_row(Row* source, void* destination) { // void* is useful for flex
 }
 
 void deserialize_row(void* source, Row* destination) {
-    memcpy(&(destination->id), (char*)source + ID_OFFSET, ID_SIZE);
-    memcpy(&(destination->username), (char*)source + USERNAME_OFFSET, USERNAME_SIZE);
     memcpy(&(destination->email), (char*)source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
+void* get_page(Pager* pager, uint32_t page_num) {
+    if (page_num > TABLE_MAX_PAGES) {
+        printf("Tried to fetch page number out of bounds. %d > %d\n", page_num, TABLE_MAX_PAGES);
+        exit(EXIT_FAILURE);
+    }
+
+    if (pager->pages[page_num] == NULL) {
+        void* page = malloc(PAGE_SIZE);
+        DWORD num_pages = pager->file_lenght / PAGE_SIZE;
+
+        if (pager->file_lenght % PAGE_SIZE) {// if this isn't true we have a partial page
+            num_pages++;
+        }
+
+        if (page_num <= num_pages) {
+            SetFilePointer(pager->file_handle, page_num * PAGE_SIZE, NULL, FILE_BEGIN);
+            DWORD bytes_read;
+            if (!ReadFile(pager->file_handle, page, PAGE_SIZE, &bytes_read, NULL)) {
+                printf("Error reading file\n");
+                exit(FatalExit);
+            }
+        }
+
+        pager->pages[page_num] = page;
+
+    }
+    return pager->pages[page_num];
+
+}
+
+
+Table* db_open(const char* filename) {
+    Pager* pager = pager_open(filename);
+    uint32_t num_rows = pager->file_lenght / ROW_SIZE;
+    
+    Table* table = malloc(sizeof(Table));
+    table->pager = pager;
+    table->num_rows = num_rows;
+
+    return table;
+}
+
+
+
 void* row_slot(Table* table, uint32_t row_num) {
     uint32_t page_num = row_num / ROWS_PER_PAGE;
-    void* page = table->pages[page_num];
-    if (page == NULL) {
-        page = table->pages[page_num] = malloc(PAGE_SIZE);
-    }
+    void* page = get_page(table->pager, page_num);
     uint32_t row_offset = row_num % ROWS_PER_PAGE;
     uint32_t byte_offset = row_offset * ROW_SIZE;
     return (char*)page + byte_offset;
@@ -220,7 +340,14 @@ ExecuteResult execute_select(Statement* statement, Table* table) {
 #pragma endregion
 
 int main(int argc, char* args[]) {
-    Table* table = new_table();
+    if (argc < 2) {
+        printf("Must supply a database filename.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    char* filename = args[1];
+    Table* table = db_open(filename);
+
     InputBuffer* input_buffer = new_input_buffer();
     while (true) {
         print_prompt();
@@ -243,6 +370,12 @@ int main(int argc, char* args[]) {
         {
         case (PREPARE_SUCCESS):
             break;
+        case (PREPARE_NEGATIVE_ID):
+            printf("ID must be positeve\n");
+            continue;
+        case (PREPARE_STRING_TOO_LONG):
+            printf("String is too long\n");
+            continue;
         case (PREPARE_SYNTAX_ERROR):
             printf("Syntax error. Could not parse statement.\n");
             continue;
