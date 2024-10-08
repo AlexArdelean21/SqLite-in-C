@@ -36,8 +36,7 @@ typedef struct {
 
 #pragma endregion
 
-
-#pragma region enums and struct
+#pragma region enums and structs
 
 typedef enum { EXECUTE_SUCCESS, EXECUTE_TABLE_FULL }ExecuteResult;
 typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
@@ -67,10 +66,15 @@ typedef struct {
     uint32_t num_rows;
 }Table;
 
+typedef struct {
+    Table* table;
+    uint32_t row_num;
+    bool end_of_table;
+} Cursor;
+
 #pragma endregion
 
-
-#pragma region part1
+#pragma region buffer
 
 InputBuffer* new_input_buffer() {
     InputBuffer* input_buffer = malloc(sizeof(InputBuffer));
@@ -113,6 +117,36 @@ void close_input_buffer(InputBuffer* new_input_buffer) {
 
 #pragma endregion
 
+#pragma region Pager
+
+Pager* pager_open(const char* filename) {
+    HANDLE file_handle = CreateFile(
+        filename,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (file_handle == INVALID_HANDLE_VALUE) {
+        printf("Unable to open file\n");
+        exit(EXIT_FAILURE);
+    }
+
+    DWORD file_size = GetFileSize(file_handle, NULL);
+
+    Pager* pager = malloc(sizeof(Pager));
+    pager->file_handle = file_handle;
+    pager->file_lenght = file_size;
+
+    for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+        pager->pages[i] = NULL;
+    }
+
+    return pager;
+}
 
 void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
     if (pager->pages[page_num] == NULL) {
@@ -127,6 +161,62 @@ void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
         printf("Error writing to file\n");
         exit(EXIT_FAILURE);
     }
+}
+
+void print_row(Row* row) {
+    printf("(%d, %s, %s)\n", row->id, row->username, row->email);
+}
+
+void serialize_row(Row* source, void* destination) { // void* is useful for flexibility and generic programming, 
+    memcpy((char*)destination + ID_OFFSET, &(source->id), ID_SIZE); // allowing the functions to handle multiple data types. 
+    memcpy((char*)destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
+    memcpy((char*)destination + EMAIL_OFFSET, &(source->email), EMAIL_SIZE);
+}
+
+void deserialize_row(void* source, Row* destination) {
+    memcpy(&(destination->email), (char*)source + EMAIL_OFFSET, EMAIL_SIZE);
+}
+
+void* get_page(Pager* pager, uint32_t page_num) {
+    if (page_num > TABLE_MAX_PAGES) {
+        printf("Tried to fetch page number out of bounds. %d > %d\n", page_num, TABLE_MAX_PAGES);
+        exit(EXIT_FAILURE);
+    }
+
+    if (pager->pages[page_num] == NULL) {
+        void* page = malloc(PAGE_SIZE);
+        DWORD num_pages = pager->file_lenght / PAGE_SIZE;
+
+        if (pager->file_lenght % PAGE_SIZE) {// if this isn't true we have a partial page
+            num_pages++;
+        }
+
+        if (page_num <= num_pages) {
+            SetFilePointer(pager->file_handle, page_num * PAGE_SIZE, NULL, FILE_BEGIN);
+            DWORD bytes_read;
+            if (!ReadFile(pager->file_handle, page, PAGE_SIZE, &bytes_read, NULL)) {
+                printf("Error reading file\n");
+                exit(FatalExit);
+            }
+        }
+        pager->pages[page_num] = page;
+
+    }
+    return pager->pages[page_num];
+
+}
+#pragma endregion
+
+#pragma region DB
+Table* db_open(const char* filename) {
+    Pager* pager = pager_open(filename);
+    uint32_t num_rows = pager->file_lenght / ROW_SIZE;
+
+    Table* table = malloc(sizeof(Table));
+    table->pager = pager;
+    table->num_rows = num_rows;
+
+    return table;
 }
 
 void db_close(Table* table) {
@@ -153,10 +243,10 @@ void db_close(Table* table) {
     }
     free(pager);
     free(table);
-
 }
+#pragma endregion
 
-#pragma region part2
+#pragma region Commands
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
     if (strcmp(input_buffer->buffer, ".exit") == 0) {
         close_input_buffer(input_buffer);
@@ -208,101 +298,72 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
 
 #pragma endregion
 
-#pragma region Part3
+#pragma region Cursor
 
-Pager* pager_open(const char* filename) {
-    HANDLE file_handle = CreateFile(
-        filename,
-        GENERIC_READ | GENERIC_WRITE,
-        0,
-        NULL,
-        OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
+Cursor* table_start(Table* table) {
+    Cursor* cursor = malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->row_num = 0;
+    cursor->end_of_table = (table->num_rows == 0);
 
-    if (file_handle == INVALID_HANDLE_VALUE) {
-        printf("Unable to open file\n");
-        exit(EXIT_FAILURE);
-    }
-
-    DWORD file_size = GetFileSize(file_handle, NULL);
-
-    Pager* pager = malloc(sizeof(Pager));
-    pager->file_handle = file_handle;
-    pager->file_lenght = file_size;
-
-    for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-        pager->pages[i] = NULL;
-    }
-
-    return pager;
+    return cursor;
 }
 
-void print_row(Row* row) {
-    printf("(%d, %s, %s)\n", row->id, row->username, row->email);
+Cursor* table_end(Table* table) {
+    Cursor* cursor = malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->row_num = table->num_rows;
+    cursor->end_of_table = true;
+
+    return cursor;
 }
 
-void serialize_row(Row* source, void* destination) { // void* is useful for flexibility and generic programming, 
-    memcpy((char*)destination + ID_OFFSET, &(source->id), ID_SIZE); // allowing the functions to handle multiple data types. 
-    memcpy((char*)destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
-    memcpy((char*)destination + EMAIL_OFFSET, &(source->email), EMAIL_SIZE);
-}
-
-void deserialize_row(void* source, Row* destination) {
-    memcpy(&(destination->email), (char*)source + EMAIL_OFFSET, EMAIL_SIZE);
-}
-
-void* get_page(Pager* pager, uint32_t page_num) {
-    if (page_num > TABLE_MAX_PAGES) {
-        printf("Tried to fetch page number out of bounds. %d > %d\n", page_num, TABLE_MAX_PAGES);
-        exit(EXIT_FAILURE);
-    }
-
-    if (pager->pages[page_num] == NULL) {
-        void* page = malloc(PAGE_SIZE);
-        DWORD num_pages = pager->file_lenght / PAGE_SIZE;
-
-        if (pager->file_lenght % PAGE_SIZE) {// if this isn't true we have a partial page
-            num_pages++;
-        }
-
-        if (page_num <= num_pages) {
-            SetFilePointer(pager->file_handle, page_num * PAGE_SIZE, NULL, FILE_BEGIN);
-            DWORD bytes_read;
-            if (!ReadFile(pager->file_handle, page, PAGE_SIZE, &bytes_read, NULL)) {
-                printf("Error reading file\n");
-                exit(FatalExit);
-            }
-        }
-
-        pager->pages[page_num] = page;
-
-    }
-    return pager->pages[page_num];
-
-}
-
-
-Table* db_open(const char* filename) {
-    Pager* pager = pager_open(filename);
-    uint32_t num_rows = pager->file_lenght / ROW_SIZE;
-    
-    Table* table = malloc(sizeof(Table));
-    table->pager = pager;
-    table->num_rows = num_rows;
-
-    return table;
-}
-
-
-
-void* row_slot(Table* table, uint32_t row_num) {
+void* cursor_value(Cursor* cursor) {
+    uint32_t row_num = cursor->row_num;
     uint32_t page_num = row_num / ROWS_PER_PAGE;
-    void* page = get_page(table->pager, page_num);
+    void* page = get_page(cursor->table->pager, page_num);
     uint32_t row_offset = row_num % ROWS_PER_PAGE;
     uint32_t byte_offset = row_offset * ROW_SIZE;
     return (char*)page + byte_offset;
+}
+
+void cursor_advance(Cursor* cursor) {
+    cursor->row_num += 1;
+    if (cursor->row_num >= cursor->table->num_rows) {
+        cursor->end_of_table = true;
+    }
+}
+
+
+#pragma endregion
+
+#pragma region Statements
+ExecuteResult execute_insert(Statement* statement, Table* table) {
+    if (table->num_rows >= TABLE_MAX_ROWS) {
+        return EXECUTE_TABLE_FULL;
+    }
+
+    Row* row_to_insert = &(statement->row_to_insert);
+    Cursor* cursor = table_end(table);
+    serialize_row(row_to_insert,cursor_value(cursor));
+    table->num_rows++;
+    free(cursor);
+
+    return EXECUTE_SUCCESS;
+}
+
+ExecuteResult execute_select(Statement* statement, Table* table) {
+    Cursor* cursor = table_start(table);
+    Row row;
+
+    while (!(cursor->end_of_table)) {
+        deserialize_row(cursor_value(cursor), &row);
+        print_row(&row);
+        cursor_advance(cursor);
+    }
+    free(cursor);
+
+    return EXECUTE_SUCCESS;
 }
 
 ExecuteResult execute_statement(Statement* statement, Table* table) {
@@ -314,29 +375,6 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
         return execute_select(statement, table);
     }
 }
-
-ExecuteResult execute_insert(Statement* statement, Table* table) {
-    if (table->num_rows >= TABLE_MAX_ROWS) {
-        return EXECUTE_TABLE_FULL;
-    }
-
-    Row* row_to_insert = &(statement->row_to_insert);
-    serialize_row(row_to_insert, row_slot(table, table->num_rows));
-    table->num_rows++;
-    return EXECUTE_SUCCESS;
-}
-
-ExecuteResult execute_select(Statement* statement, Table* table) {
-    Row row;
-    for (uint32_t i = 0; i < table->num_rows; i++) {
-        deserialize_row(row_slot(table, i), &row);
-        print_row(&row);
-    }
-    return EXECUTE_SUCCESS;
-}
-
-
-
 #pragma endregion
 
 int main(int argc, char* args[]) {
