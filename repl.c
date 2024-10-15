@@ -548,12 +548,14 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
 #pragma endregion
 
 int main(int argc, char* args[]) {
+    char* filename;
     if (argc < 2) {
-        printf("Must supply a database filename.\n");
-        exit(EXIT_FAILURE);
+        filename = "myDatabase.db";
+    }
+    else {
+        filename = args[1];
     }
 
-    char* filename = args[1];
     Table* table = db_open(filename);
 
     InputBuffer* input_buffer = new_input_buffer();
