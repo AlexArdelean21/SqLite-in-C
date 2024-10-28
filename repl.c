@@ -99,6 +99,7 @@ typedef struct {
 typedef struct {
     StatementType type;
     Row row_to_insert;
+	uint32_t id_to_delete; // used for delete statement
 }Statement;
 
 typedef struct {
@@ -287,7 +288,6 @@ void print_row(Row* row) {
 }
 
 void serialize_row(Row* source, void* destination) {
-    printf("Serializing row: (%d, %s, %s)\n", source->id, source->username, source->email);
     memcpy((char*)destination + ID_OFFSET, &(source->id), ID_SIZE);
     strncpy((char*)destination + USERNAME_OFFSET, source->username, COLUMN_USERNAME_SIZE);
     strncpy((char*)destination + EMAIL_OFFSET, source->email, COLUMN_EMAIL_SIZE);
@@ -299,8 +299,6 @@ void deserialize_row(void* source, Row* destination) {
     destination->username[COLUMN_USERNAME_SIZE] = '\0';
     strncpy(destination->email, (char*)source + EMAIL_OFFSET, COLUMN_EMAIL_SIZE);
     destination->email[COLUMN_EMAIL_SIZE] = '\0';
-
-    printf("Deserialized row: (%d, %s, %s)\n", destination->id, destination->username, destination->email);
 }
 
 
@@ -548,7 +546,7 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
 	uint32_t splitting_root = is_node_root(old_node);
 
     void* parent;
-    void* new_node;
+    void* new_node = NULL;
 
 	if (splitting_root) {
 		create_new_root(table, new_page_num);
@@ -794,6 +792,24 @@ PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
     return PREPARE_SUCCESS;
 }
 
+PrepareResult prepare_delete(InputBuffer* input_buffer, Statement* statement) {
+    statement->type = STATEMENT_DELETE;
+    char* keyword = strtok(input_buffer->buffer, " ");
+    char* id_string = strtok(NULL, " ");
+
+    if (id_string == NULL) {
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    int id = atoi(id_string);
+    if (id < 0) {
+        return PREPARE_NEGATIVE_ID;
+    }
+
+    statement->id_to_delete = id;
+    return PREPARE_SUCCESS;
+}
+
 PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement) {
     if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
         return prepare_insert(input_buffer, statement); 
@@ -803,8 +819,14 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
         statement->type = STATEMENT_SELECT;
         return PREPARE_SUCCESS;
     }
+
+	if (strncmp(input_buffer->buffer, "delete", 6) == 0) {
+		return prepare_delete(input_buffer, statement);
+	}
+
     return PREPARE_UNRECOGNIZED_STATEMENT;
 }
+
 
 void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
     void* node = get_page(cursor->table->pager, cursor->page_num);
@@ -921,6 +943,34 @@ ExecuteResult execute_select(Statement* statement, Table* table) {
     return EXECUTE_SUCCESS;
 }
 
+ExecuteResult execute_delete(Statement* statement, Table* table) {
+    uint32_t id_to_delete = statement->id_to_delete;
+	Cursor* cursor = table_find(table, id_to_delete);
+
+    void* node = get_page(table->pager, cursor->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+
+    if (cursor->cell_num >= num_cells) { // Id not found
+		free(cursor);
+		return EXECUTE_SUCCESS;
+    }
+
+	uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num); // Id not found 
+    if (key_at_index != id_to_delete) {
+		free(cursor);
+		return EXECUTE_SUCCESS;
+    }
+
+    // shift cells to the left
+	for (uint32_t i = cursor->cell_num; i < num_cells - 1; i++) {
+		memcpy(leaf_node_cell(node, i), leaf_node_cell(node, i + 1), LEAF_NODE_CELL_SIZE);
+	}
+
+	(*leaf_node_num_cells(node))--;
+    free(cursor);
+	return EXECUTE_SUCCESS;
+}
+
 ExecuteResult execute_statement(Statement* statement, Table* table) {
     switch (statement->type)
     {
@@ -928,6 +978,8 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
         return execute_insert(statement, table);
     case(STATEMENT_SELECT):
         return execute_select(statement, table);
+	case(STATEMENT_DELETE):
+		return execute_delete(statement, table);
     }
 }
 #pragma endregion
