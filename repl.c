@@ -78,7 +78,7 @@ typedef struct {
 #pragma region enums and structs
 
 typedef enum { EXECUTE_SUCCESS, EXECUTE_DUPLICATE_KEY, EXECUTE_TABLE_FULL } ExecuteResult;
-typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
+typedef enum { STATEMENT_INSERT, STATEMENT_SELECT, STATEMENT_DELETE } StatementType;
 typedef enum { META_COMMAND_SUCCESS, META_COMMAND_UNRECOGNIZED_COMMAND } MetaCommandResult;
 typedef enum { PREPARE_SUCCESS, PREPARE_NEGATIVE_ID, PREPARE_STRING_TOO_LONG, PREPARE_SYNTAX_ERROR, PREPARE_UNRECOGNIZED_STATEMENT } PrepareResult;
 typedef enum { NODE_INTERNAL, NODE_LEAF} NodeType;
@@ -286,21 +286,23 @@ void print_row(Row* row) {
     printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
-void serialize_row(Row* source, void* destination) { // void* is useful for flexibility and generic programming, 
-    memcpy((char*)destination + ID_OFFSET, &(source->id), ID_SIZE); // allowing the functions to handle multiple data types. 
-    memcpy((char*)destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
-    memcpy((char*)destination + EMAIL_OFFSET, &(source->email), EMAIL_SIZE);
+void serialize_row(Row* source, void* destination) {
+    printf("Serializing row: (%d, %s, %s)\n", source->id, source->username, source->email);
+    memcpy((char*)destination + ID_OFFSET, &(source->id), ID_SIZE);
+    strncpy((char*)destination + USERNAME_OFFSET, source->username, COLUMN_USERNAME_SIZE);
+    strncpy((char*)destination + EMAIL_OFFSET, source->email, COLUMN_EMAIL_SIZE);
 }
 
-void deserialize_row(void* source, Row* destination) { // add name and id
-    memcpy(&(destination->id),(char*)source + ID_OFFSET, ID_SIZE);
+void deserialize_row(void* source, Row* destination) {
+    memcpy(&(destination->id), (char*)source + ID_OFFSET, ID_SIZE);
+    strncpy(destination->username, (char*)source + USERNAME_OFFSET, COLUMN_USERNAME_SIZE);
+    destination->username[COLUMN_USERNAME_SIZE] = '\0';
+    strncpy(destination->email, (char*)source + EMAIL_OFFSET, COLUMN_EMAIL_SIZE);
+    destination->email[COLUMN_EMAIL_SIZE] = '\0';
 
-    memcpy(&(destination->username), (char*)source + USERNAME_OFFSET, USERNAME_SIZE);
-	destination->username[USERNAME_SIZE] = '\0';
-
-    memcpy(&(destination->email), (char*)source + EMAIL_OFFSET, EMAIL_SIZE);
-	destination->email[EMAIL_SIZE] = '\0';
+    printf("Deserialized row: (%d, %s, %s)\n", destination->id, destination->username, destination->email);
 }
+
 
 uint32_t* internal_node_num_keys(void* node) {
     return (char*)node + INTERNAL_NODE_NUM_KEYS_OFFSET;
@@ -352,8 +354,11 @@ void* get_page(Pager* pager, uint32_t page_num) {
     }
 
     if (pager->pages[page_num] == NULL) {
-        void* page = malloc(PAGE_SIZE);
-        DWORD num_pages = pager->file_lenght / PAGE_SIZE;
+        void* page = calloc(1, PAGE_SIZE);  // Allocate and zero out memory
+        if (page == NULL) {
+            printf("Error allocating memory for page\n");
+            exit(EXIT_FAILURE);
+        }        DWORD num_pages = pager->file_lenght / PAGE_SIZE;
 
         if (pager->file_lenght % PAGE_SIZE) {// if this isn't true we have a partial page
             num_pages++;
@@ -986,6 +991,5 @@ int main(int argc, char* args[]) {
             printf("error: Table full.\n");
             break;
         }
-        
     }   
 }
